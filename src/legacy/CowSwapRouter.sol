@@ -12,6 +12,11 @@ interface ICowSettler {
     function settle(bytes calldata orderUid) external;
 }
 
+/// @title CowSwapRouter (Legacy)
+/// @notice Simple one-shot CoW Protocol deposit-and-settle helper.
+/// @dev DEPRECATED - use CowTwapExecutor for TWAP order splitting.
+///      This contract is a thin wrapper around CoW Protocol's existing contracts.
+///      It is preserved here for reference and backward compatibility only.
 contract CowSwapRouter is ReentrancyGuard {
     using SafeERC20 for IERC20;
 

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import {CowSwapRouter, ICowVaultRelayer, ICowSettler} from "../src/CowSwapRouter.sol";
+import {CowSwapRouter, ICowVaultRelayer, ICowSettler} from "../src/legacy/CowSwapRouter.sol";
 
 // ---------------------------------------------------------------------------
 // Mock ERC20 — tracks allowances so approval-reset tests work correctly
