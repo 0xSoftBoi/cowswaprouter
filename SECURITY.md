@@ -88,6 +88,21 @@ They do NOT verify:
 
 ---
 
+## Wake Static Analysis Results
+
+Analyzed with `wake detect all --min-impact medium` on `src/CowTwapExecutor.sol`:
+
+**Result: No findings in `src/CowTwapExecutor.sol`.**
+
+The contract uses OpenZeppelin's `SafeERC20.safeTransferFrom` and `forceApprove` throughout — Wake's `unsafe-erc20-call` detector found no issues in the production contract. The only detector hits were in `tests/contracts/Mocks.sol` (a raw `IERC20.transferFrom` in the mock relayer — expected for test infrastructure).
+
+CEI pattern is strictly followed:
+- `createTwapOrder`: transfers tokens IN first (interaction), then records order (effect)
+- `executeSlice`: updates all state (effects) before calling relayer/settler (interactions)
+- `cancelTwapOrder`: sets status = CANCELLED (effect) before transferring refund out (interaction)
+
+---
+
 ## Known Limitations
 
 | Issue | Impact | Workaround |
