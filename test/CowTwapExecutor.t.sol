@@ -36,14 +36,30 @@ contract MockToken {
     }
 }
 
+/// Mimics GPv2VaultRelayer: a solver settlement pulls the sell token from the executor's
+/// escrow via the standing approval. (Real relayer is called by GPv2Settlement; here a
+/// test acts as the "solver" and calls pull directly.)
 contract MockRelayer {
-    uint256 public depositCount;
-    function deposit(address, address, uint256) external { depositCount++; }
+    function pull(address token, address from, address to, uint256 amount) external {
+        MockToken(token).transferFrom(from, to, amount);
+    }
 }
 
-contract MockSettler {
-    uint256 public settleCount;
-    function settle(bytes calldata) external { settleCount++; }
+/// Mimics GPv2Settlement's PreSign + vaultRelayer surface (what a contract actually uses).
+contract MockSettlement {
+    address public vaultRelayer;
+    mapping(bytes32 => bool) public presigned;
+    uint256 public presignCount;
+
+    constructor() { vaultRelayer = address(new MockRelayer()); }
+
+    function setPreSignature(bytes calldata uid, bool signed) external {
+        bytes32 k = keccak256(uid);
+        bool was = presigned[k];
+        presigned[k] = signed;
+        if (signed && !was) presignCount++;
+        if (!signed && was) presignCount--;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,8 +69,7 @@ contract MockSettler {
 contract CowTwapExecutorTest is Test {
     CowTwapExecutor public executor;
     MockToken       public token;
-    MockRelayer     public relayer;
-    MockSettler     public settler;
+    MockSettlement  public settlement;
 
     address constant OWNER   = address(0xAA01);
     address constant KEEPER  = address(0xAA02);
@@ -65,10 +80,9 @@ contract CowTwapExecutorTest is Test {
     uint256 constant INTERVAL = 1 hours;
 
     function setUp() public {
-        relayer  = new MockRelayer();
-        settler  = new MockSettler();
-        executor = new CowTwapExecutor(address(relayer), address(settler));
-        token    = new MockToken();
+        settlement = new MockSettlement();
+        executor   = new CowTwapExecutor(address(settlement));
+        token      = new MockToken();
 
         token.mint(OWNER, TOTAL * 10);
         vm.prank(OWNER);
@@ -107,29 +121,68 @@ contract CowTwapExecutorTest is Test {
         vm.prank(OWNER);
         uint256 id = executor.createTwapOrder(address(token), TOTAL, SLICES, INTERVAL, 0);
 
-        bytes memory uid = hex"deadbeef";
-
-        // Execute all slices
+        // Each slice has its own orderUid (distinct validTo windows), as on real CoW.
         for (uint256 i = 0; i < SLICES; i++) {
             assertTrue(executor.isSliceReady(id), "Slice should be ready");
+            bytes memory uid = abi.encodePacked("slice", i);
             vm.prank(KEEPER);
             executor.executeSlice(id, uid);
+            assertTrue(settlement.presigned(keccak256(uid)), "slice presigned");
 
             ICowTwapExecutor.TwapOrder memory o = executor.getOrder(id);
             assertEq(o.slicesExecuted, i + 1);
 
             if (i < SLICES - 1) {
                 assertEq(uint8(o.status), uint8(ICowTwapExecutor.TwapStatus.ACTIVE));
-                // Advance time for next slice
                 vm.warp(block.timestamp + INTERVAL + 1);
             } else {
                 assertEq(uint8(o.status), uint8(ICowTwapExecutor.TwapStatus.COMPLETED));
             }
         }
 
-        // Relayer and settler called once per slice
-        assertEq(relayer.depositCount(), SLICES);
-        assertEq(settler.settleCount(), SLICES);
+        // One presignature authorized per slice (the contract authorizes, solvers settle).
+        assertEq(settlement.presignCount(), SLICES);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 2b: a simulated solver settlement pulls exactly one slice from escrow
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function testSolverFillPullsOneSlice() public {
+        vm.prank(OWNER);
+        uint256 id = executor.createTwapOrder(address(token), TOTAL, SLICES, INTERVAL, 0);
+
+        bytes memory uid = hex"deadbeef";
+        vm.prank(KEEPER);
+        executor.executeSlice(id, uid);
+        assertTrue(settlement.presigned(keccak256(uid)), "slice must be presigned");
+
+        // The relayer (approved at creation) pulls one slice to the solver — escrow drops.
+        uint256 perSlice = TOTAL / SLICES;
+        uint256 escrowBefore = token.balanceOf(address(executor));
+        address relayer = settlement.vaultRelayer();
+        MockRelayer(relayer).pull(address(token), address(executor), address(0x5050), perSlice);
+
+        assertEq(escrowBefore - token.balanceOf(address(executor)), perSlice, "one slice pulled");
+        assertEq(token.balanceOf(address(0x5050)), perSlice);
+    }
+
+    function testRevokePresignature() public {
+        vm.prank(OWNER);
+        uint256 id = executor.createTwapOrder(address(token), TOTAL, SLICES, INTERVAL, 0);
+        bytes memory uid = hex"deadbeef";
+        vm.prank(KEEPER);
+        executor.executeSlice(id, uid);
+        assertTrue(settlement.presigned(keccak256(uid)));
+
+        // Only owner can revoke; revoking un-authorizes the in-flight slice.
+        vm.expectRevert();
+        vm.prank(STRANGER);
+        executor.revokePresignature(id, uid);
+
+        vm.prank(OWNER);
+        executor.revokePresignature(id, uid);
+        assertFalse(settlement.presigned(keccak256(uid)), "slice no longer fillable");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

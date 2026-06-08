@@ -57,31 +57,31 @@ interface IERC20Pull {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
 }
 
-/// @notice Mock CoW relayer — simulates GPv2VaultRelayer by pulling tokens via transferFrom.
-/// The real relayer is pre-approved by the executor and calls transferFrom on each deposit.
+/// @notice Mock GPv2VaultRelayer — a solver settlement pulls the executor's escrow via the
+/// standing approval. In production GPv2Settlement calls the relayer; here a test acts as
+/// the solver and calls `pull` directly.
 contract MockRelayer {
-    uint256 public depositCount;
-    address public lastToken;
-    address public lastSender;
-    uint256 public lastAmount;
-
-    function deposit(address token, address from, uint256 amount) external {
-        depositCount++;
-        lastToken  = token;
-        lastSender = from;
-        lastAmount = amount;
-        // Simulate real relayer: pull tokens from the caller (CowTwapExecutor) using approval
-        IERC20Pull(token).transferFrom(msg.sender, address(this), amount);
+    function pull(address token, address from, address to, uint256 amount) external {
+        IERC20Pull(token).transferFrom(from, to, amount);
     }
 }
 
-/// @notice Mock CoW settler — accepts settle() calls and records count.
-contract MockSettler {
-    uint256 public settleCount;
-    bytes   public lastOrderUid;
+/// @notice Mock GPv2Settlement — exposes the PreSign + vaultRelayer surface a contract uses.
+/// The executor presigns each slice's orderUid (it never calls settle, which is onlySolver).
+contract MockSettlement {
+    address public vaultRelayer;
+    mapping(bytes32 => bool) public presigned;
+    uint256 public presignCount;
 
-    function settle(bytes calldata orderUid) external {
-        settleCount++;
-        lastOrderUid = orderUid;
+    constructor() {
+        vaultRelayer = address(new MockRelayer());
+    }
+
+    function setPreSignature(bytes calldata uid, bool signed) external {
+        bytes32 k = keccak256(uid);
+        bool was = presigned[k];
+        presigned[k] = signed;
+        if (signed && !was) presignCount++;
+        if (!signed && was) presignCount--;
     }
 }

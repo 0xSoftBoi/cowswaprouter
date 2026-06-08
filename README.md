@@ -1,41 +1,64 @@
 # cowswaprouter
 
-CoW Protocol order routing in Solidity. Deposits tokens into the CoW vault relayer, approves the relayer to pull funds, and triggers batch auction settlement — all in a single transaction. MEV-protected by design: orders settle through CoW Protocol's batch auction rather than directly through an AMM, so there's no on-chain price exposure for front-runners to exploit.
+TWAP order execution on [CoW Protocol](https://docs.cow.fi/), in Solidity. Split a large
+sell order into N time-sliced parts to reduce price impact — settled through CoW's batch
+auction, where solvers compete and every order in a batch clears at a **uniform price**.
+
+Two ways to do it, both here:
+
+- **`CowTwapExecutor`** — a self-hosted executor. Escrow the full amount, then on a timer
+  authorize each slice's CoW order via the **PreSign** scheme (`setPreSignature`). Solvers
+  fill the slices; the vault relayer pulls funds during settlement.
+- **`CowTwapHandler`** — the official-framework path: a [ComposableCoW](https://docs.cow.fi/cow-protocol/reference/contracts/periphery/composable-cow)
+  `IConditionalOrder`. Register one conditional order; CoW's *watchtower* calls
+  `getTradeableOrder()` each block to get the part valid now, and the settlement contract
+  calls `verify()` so a solver can only fill the part the handler currently authorizes —
+  **validated discretization**, on-chain cancellation, no custom keeper.
+
+How they relate, and why I rewrote the executor's CoW integration (it previously called
+mainnet-nonexistent `deposit`/`settle` functions): [the write-up](https://0xsoftboi.github.io/blog/how-cow-protocol-settles/).
+
+## How CoW actually settles (the model these contracts target)
+
+- Orders are **intents**, not swaps. You sign/authorize "sell ≤ X for ≥ Y by time T"; a
+  solver settles a whole batch. There is no on-chain swap to front-run within a batch —
+  everyone trading a pair clears at the same price (uniform clearing price = MEV protection
+  at the batch level; each slice still sets `minAmountOutPerSlice` for its own limit).
+- You approve the **`GPv2VaultRelayer`** (`0xC92E…0110`), not the settlement contract; the
+  relayer pulls funds only as part of a settlement of an order you authorized.
+- A contract authorizes an order via **`setPreSignature(orderUid, true)`** or ERC-1271 —
+  `settle()` is `onlySolver`, so a normal contract never calls it. `CowTwapExecutor`
+  presigns; it does not (and cannot) settle.
 
 ## Stack
 
-- Solidity `^0.8.20`
-- [Foundry](https://book.getfoundry.sh/)
+- Solidity `^0.8.20`, [Foundry](https://book.getfoundry.sh/).
+- Optional: a [Wake](https://getwake.io/) stateful fuzz suite under `tests/`
+  (kept consistent with the contracts; the Foundry suite in `test/` is the executed one).
 
-## Build
+## Build & test
 
 ```bash
 forge build
-```
-
-## Test
-
-```bash
-forge test -vv
+forge test -vv     # 26 tests: executor (presign + simulated solver fill), handler, legacy
 ```
 
 ## Deploy
 
 ```bash
-forge create src/cowrouter.sol:CowSwapRouter \
-  --constructor-args <relayer_address> <settler_address>
+# TWAP executor — pass the GPv2Settlement address; the vault relayer is read from it.
+forge create src/CowTwapExecutor.sol:CowTwapExecutor \
+  --constructor-args 0x9008D19f58AAbD9eD0D60971565AA8510560ab41   # mainnet GPv2Settlement
+
+# ComposableCoW TWAP handler — stateless; register it as a conditional-order handler.
+forge create src/CowTwapHandler.sol:CowTwapHandler
 ```
 
-- `<relayer_address>` — CoW Protocol vault relayer (`GPv2VaultRelayer`)
-- `<settler_address>` — CoW Protocol settlement contract (`GPv2Settlement`)
+`src/legacy/CowSwapRouter.sol` is a **deprecated** single-shot deposit-and-settle sketch
+kept for reference (it targets a simplified interface, not the real protocol).
 
-## How it works
+## Security
 
-`depositAndSettle(owner, token, amount, orderUid)` does four things in sequence:
-
-1. **Pull tokens** — calls `transferFrom(owner, router, amount)` to bring the tokens on-chain into the router.
-2. **Approve relayer** — calls `approve(cowRelayer, amount)` so the CoW vault relayer can move the tokens.
-3. **Deposit** — calls `ICowVaultRelayer.deposit(token, owner, amount)`, registering the funds with CoW's settlement infrastructure.
-4. **Settle** — if `orderUid` is non-empty, calls `ICowSettler.settle(orderUid)` to finalize the batch auction order.
-
-The `orderUid` parameter is optional — pass an empty bytes value to skip settlement and leave the order pending in the CoW batch queue.
+Not audited; educational. The presign/handler logic is verified on-chain against faithful
+mocks (no live solver). See [SECURITY.md](SECURITY.md) for the threat model, the dust /
+in-flight-presign caveats, and the MEV protection's exact scope.
