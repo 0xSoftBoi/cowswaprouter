@@ -1,106 +1,81 @@
 """
-Wake Fuzz Test: CowTwapExecutor
-================================
+Wake Fuzz Test: CowTwapExecutor (CoW PreSign model)
+===================================================
 Stateful property-based test covering:
-  - TWAP lifecycle: create → execute N slices → complete
-  - Time interval enforcement (SliceNotReady revert before interval elapses)
+  - TWAP lifecycle: create -> execute (presign) N slices -> complete
+  - Time interval enforcement (revert before interval elapses)
   - Permissionless execution (anyone can call executeSlice)
-  - Cancellation refund math: refund == totalAmount - (slicesExecuted * amountPerSlice)
-  - Access control: only order owner can cancel
+  - Cancellation refund math: refund == totalAmount - slicesExecuted * amountPerSlice
+  - Access control: only the order owner can cancel
   - State machine: no actions on COMPLETED or CANCELLED orders
-  - No token balance leak: tokens are either settled or refunded
+  - Escrow accounting: executeSlice only PRESIGNS (no synchronous transfer); the executor
+    keeps the escrow until a solver settles (not simulated here), so escrow stays at the
+    deposited amount until cancellation refunds the un-executed remainder.
 
-Run: wake test tests/test_twap_wake.py -v
+NOTE: this suite is kept consistent with the contract but is not run in CI here; the
+Foundry suite (test/) is the executed one. Run locally: wake test tests/test_twap_wake.py -v
 """
 
 from wake.testing import *
 from wake.testing.fuzzing import *
 from pytypes.src.CowTwapExecutor import CowTwapExecutor
 from pytypes.src.interfaces.ICowTwapExecutor import ICowTwapExecutor
-from pytypes.tests.contracts.Mocks import MockToken, MockRelayer, MockSettler
+from pytypes.tests.contracts.Mocks import MockToken, MockSettlement
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 TOTAL_AMOUNT = 1_000 * 10**18
 SLICE_COUNT  = 4
-INTERVAL     = 3600          # 1 hour in seconds
+INTERVAL     = 3600
 AMOUNT_PER_SLICE = TOTAL_AMOUNT // SLICE_COUNT
 
-DUMMY_ORDER_UID = b"test_order_uid_for_wake_fuzzing"
+
+def _uid(i: int) -> bytes:
+    # Each slice has its own orderUid (distinct validTo windows), as on real CoW.
+    return b"slice_" + i.to_bytes(2, "big")
 
 
-# ---------------------------------------------------------------------------
-# Stateful FuzzTest
-# ---------------------------------------------------------------------------
+def _deploy(owner):
+    settlement = MockSettlement.deploy(from_=owner)
+    executor   = CowTwapExecutor.deploy(settlement.address, from_=owner)
+    token      = MockToken.deploy("USD Coin", "USDC", from_=owner)
+    return settlement, executor, token
+
 
 class TwapFuzzTest(FuzzTest):
-    """
-    Stateful fuzzer: random mix of create / executeSlice / cancel flows.
-    Invariants checked after every flow.
-    """
+    """Stateful fuzzer: random mix of create / executeSlice / cancel flows."""
 
-    executor: CowTwapExecutor
-    token:    MockToken
-    relayer:  MockRelayer
-    settler:  MockSettler
-    owner:    Account
-    keeper:   Account
-    stranger: Account
+    executor:   CowTwapExecutor
+    token:      MockToken
+    settlement: MockSettlement
+    owner:      Account
+    keeper:     Account
+    stranger:   Account
 
-    # Track ghost state independently from contract
-    _active_order_id: int   # 0 = none
-    _slices_ghost: int       # slices we've executed, tracked independently
+    _active_order_id: int
+    _slices_ghost: int
     _cancelled: bool
-    _expected_escrow: int    # tokens we expect the executor to hold
+    _expected_escrow: int
 
     def pre_sequence(self) -> None:
-        self.owner   = chain.accounts[0]
-        self.keeper  = chain.accounts[1]
+        self.owner    = chain.accounts[0]
+        self.keeper   = chain.accounts[1]
         self.stranger = chain.accounts[2]
 
-        self.relayer  = MockRelayer.deploy(from_=self.owner)
-        self.settler  = MockSettler.deploy(from_=self.owner)
-        self.executor = CowTwapExecutor.deploy(
-            self.relayer.address,
-            self.settler.address,
-            from_=self.owner,
-        )
-        self.token = MockToken.deploy("USD Coin", "USDC", from_=self.owner)
-
-        # Seed owner with tokens + approve
+        self.settlement, self.executor, self.token = _deploy(self.owner)
         self.token.mint(self.owner.address, 10 * TOTAL_AMOUNT, from_=self.owner)
         self.token.approve(self.executor.address, 2**256 - 1, from_=self.owner)
 
-        # No active order at start
         self._active_order_id = 0
         self._slices_ghost = 0
         self._cancelled = False
         self._expected_escrow = 0
 
-    # -----------------------------------------------------------------------
-    # Flows
-    # -----------------------------------------------------------------------
-
     @flow(weight=20)
     def flow_create_order(self) -> None:
-        """Create a new TWAP order if none active."""
-        if self._active_order_id != 0:
-            return  # already have an order
-
-        # Only create a new order if not in a cancelled state (to avoid ghost state confusion)
-        if self._cancelled:
+        if self._active_order_id != 0 or self._cancelled:
             return
-
         tx = self.executor.createTwapOrder(
-            self.token.address,
-            TOTAL_AMOUNT,
-            SLICE_COUNT,
-            INTERVAL,
-            0,   # no min out
-            from_=self.owner,
+            self.token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=self.owner
         )
         self._active_order_id = tx.return_value
         self._slices_ghost = 0
@@ -108,7 +83,6 @@ class TwapFuzzTest(FuzzTest):
 
     @flow(weight=40)
     def flow_execute_slice_valid(self) -> None:
-        """Execute the next slice after interval has elapsed."""
         if self._active_order_id == 0 or self._cancelled:
             return
         order = self.executor.getOrder(self._active_order_id)
@@ -117,52 +91,30 @@ class TwapFuzzTest(FuzzTest):
         if order.slicesExecuted >= SLICE_COUNT:
             return
 
-        # Advance chain time past the interval
-        chain.set_next_block_timestamp(
-            chain.blocks["latest"].timestamp + INTERVAL + 1
-        )
+        chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
         chain.mine()
 
-        self.executor.executeSlice(
-            self._active_order_id,
-            DUMMY_ORDER_UID,
-            from_=self.keeper,   # keeper executes (permissionless)
-        )
+        self.executor.executeSlice(self._active_order_id, _uid(self._slices_ghost), from_=self.keeper)
         self._slices_ghost += 1
-        self._expected_escrow -= AMOUNT_PER_SLICE  # relayer pulls this slice's tokens
+        # executeSlice only PRESIGNS — escrow is unchanged until a solver settles.
 
         if self._slices_ghost >= SLICE_COUNT:
-            self._active_order_id = 0  # order completed
+            self._active_order_id = 0
 
     @flow(weight=15)
     def flow_execute_slice_too_early(self) -> None:
-        """Try to execute slice before interval — should revert.
-
-        Only valid after at least one slice has been executed: the first slice
-        is always ready because lastExecutedAt=0 < any real block.timestamp.
-        """
         if self._active_order_id == 0 or self._cancelled:
             return
         order = self.executor.getOrder(self._active_order_id)
         if order.status != ICowTwapExecutor.TwapStatus.ACTIVE:
             return
         if order.slicesExecuted == 0 or order.slicesExecuted >= SLICE_COUNT:
-            # First slice: lastExecutedAt=0, always passes the timestamp check
-            # Completed: nothing to execute
             return
-
-        # After at least one slice, lastExecutedAt > 0.
-        # Attempt immediately without time advance — must revert.
         with must_revert():
-            self.executor.executeSlice(
-                self._active_order_id,
-                DUMMY_ORDER_UID,
-                from_=self.keeper,
-            )
+            self.executor.executeSlice(self._active_order_id, _uid(99), from_=self.keeper)
 
     @flow(weight=15)
     def flow_cancel_order(self) -> None:
-        """Owner cancels an active order and verifies refund."""
         if self._active_order_id == 0 or self._cancelled:
             return
         order = self.executor.getOrder(self._active_order_id)
@@ -175,328 +127,192 @@ class TwapFuzzTest(FuzzTest):
 
         self.executor.cancelTwapOrder(self._active_order_id, from_=self.owner)
 
-        balance_after = self.token.balanceOf(self.owner.address)
-        actual_refund = balance_after - balance_before
-
+        actual_refund = self.token.balanceOf(self.owner.address) - balance_before
         assert actual_refund == expected_refund, (
-            f"Refund mismatch: expected {expected_refund}, got {actual_refund} "
-            f"(slices_done={slices_done})"
+            f"Refund mismatch: expected {expected_refund}, got {actual_refund} (slices_done={slices_done})"
         )
         self._cancelled = True
         self._active_order_id = 0
-        self._expected_escrow -= expected_refund  # refund left the contract
+        self._expected_escrow -= expected_refund
 
     @flow(weight=10)
     def flow_stranger_cannot_cancel(self) -> None:
-        """Non-owner cannot cancel an active order."""
         if self._active_order_id == 0 or self._cancelled:
             return
         order = self.executor.getOrder(self._active_order_id)
         if order.status != ICowTwapExecutor.TwapStatus.ACTIVE:
             return
-
         with must_revert():
-            self.executor.cancelTwapOrder(
-                self._active_order_id,
-                from_=self.stranger,
-            )
-
-    # -----------------------------------------------------------------------
-    # Invariants
-    # -----------------------------------------------------------------------
-
-    @invariant()
-    def invariant_executor_balance_nonnegative(self) -> None:
-        """Contract should never hold more tokens than it was given."""
-        balance = self.token.balanceOf(self.executor.address)
-        assert balance >= 0, "Invariant: contract balance underflowed"
+            self.executor.cancelTwapOrder(self._active_order_id, from_=self.stranger)
 
     @invariant()
     def invariant_slices_monotonic(self) -> None:
-        """slicesExecuted never decreases and never exceeds sliceCount."""
         if self._active_order_id == 0:
             return
         try:
             order = self.executor.getOrder(self._active_order_id)
-            assert order.slicesExecuted <= SLICE_COUNT, (
-                f"slicesExecuted {order.slicesExecuted} > sliceCount {SLICE_COUNT}"
-            )
-            assert order.slicesExecuted >= self._slices_ghost - 1, (
-                f"slicesExecuted regressed: contract={order.slicesExecuted}, ghost={self._slices_ghost}"
-            )
+            assert order.slicesExecuted <= SLICE_COUNT
+            assert order.slicesExecuted >= self._slices_ghost - 1
         except TransactionRevertedError:
-            pass  # order may not exist yet
+            pass
 
     @invariant()
     def invariant_escrow_matches_ghost(self) -> None:
-        """
-        Executor token balance must match our independently tracked expected balance.
-        Divergence means tokens are leaking (created but not settled/refunded) or
-        being over-withdrawn.
-        """
+        # No solver fill is simulated, so escrow == deposited - refunded.
         balance = self.token.balanceOf(self.executor.address)
         assert balance == self._expected_escrow, (
             f"Escrow divergence: actual={balance}, ghost={self._expected_escrow}"
         )
 
     @invariant()
-    def invariant_no_double_settle(self) -> None:
-        """settle() call count must equal total slices executed across all orders."""
-        # Each executeSlice calls settler.settle() once
-        # We can't track across multiple orders in this simple test,
-        # but within a sequence the settle count must be consistent
-        settle_count = self.settler.settleCount()
-        assert settle_count >= 0, "settleCount is negative (impossible)"
+    def invariant_presign_count_sane(self) -> None:
+        # One presignature per executed slice (each a distinct orderUid).
+        assert self.settlement.presignCount() >= 0
 
-
-# ---------------------------------------------------------------------------
-# Deterministic unit tests
-# ---------------------------------------------------------------------------
 
 @chain.connect()
 def test_full_lifecycle():
-    """Create TWAP order → execute all slices → verify completed state."""
-    owner  = chain.accounts[0]
-    keeper = chain.accounts[1]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, keeper = chain.accounts[0], chain.accounts[1]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
 
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
-
-    # Verify escrow: contract holds full amount
     assert token.balanceOf(executor.address) == TOTAL_AMOUNT, "Escrow not funded"
 
     for i in range(SLICE_COUNT):
         chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
         chain.mine()
-        executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
+        executor.executeSlice(order_id, _uid(i), from_=keeper)
+        assert settlement.presigned(keccak256(_uid(i))), "slice not presigned"
 
     order = executor.getOrder(order_id)
-    assert order.status == ICowTwapExecutor.TwapStatus.COMPLETED, (
-        f"Expected COMPLETED, got {order.status}"
-    )
+    assert order.status == ICowTwapExecutor.TwapStatus.COMPLETED
     assert order.slicesExecuted == SLICE_COUNT
-    assert settler.settleCount() == SLICE_COUNT
-
-    print(f"[PASS] Full lifecycle: {SLICE_COUNT} slices executed, order COMPLETED")
-    print(f"       settle() called {settler.settleCount()} times, deposit() called {relayer.depositCount()} times")
+    assert settlement.presignCount() == SLICE_COUNT
+    # Escrow stays fully funded until a solver settles each presigned slice.
+    assert token.balanceOf(executor.address) == TOTAL_AMOUNT
+    print(f"[PASS] Lifecycle: {SLICE_COUNT} slices presigned, order COMPLETED")
 
 
 @chain.connect()
 def test_time_enforcement():
-    """executeSlice reverts if called before intervalSeconds has elapsed."""
-    owner  = chain.accounts[0]
-    keeper = chain.accounts[1]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, keeper = chain.accounts[0], chain.accounts[1]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
-
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
 
-    # Execute first slice (no interval constraint on first)
     chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
     chain.mine()
-    executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
-    # Immediate second attempt should revert
+    executor.executeSlice(order_id, _uid(0), from_=keeper)
     with must_revert():
-        executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
-    # After waiting, it should succeed
+        executor.executeSlice(order_id, _uid(1), from_=keeper)
     chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
     chain.mine()
-    executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
-    order = executor.getOrder(order_id)
-    assert order.slicesExecuted == 2
-
-    print("[PASS] Time enforcement: premature call reverted, subsequent call succeeded")
+    executor.executeSlice(order_id, _uid(1), from_=keeper)
+    assert executor.getOrder(order_id).slicesExecuted == 2
+    print("[PASS] Time enforcement: premature call reverted, later call succeeded")
 
 
 @chain.connect()
 def test_cancellation_refund_math():
-    """Cancel after N slices: refund == totalAmount - N * amountPerSlice."""
-    owner  = chain.accounts[0]
-    keeper = chain.accounts[1]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, keeper = chain.accounts[0], chain.accounts[1]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
-
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
 
-    # Execute exactly 2 slices
-    for _ in range(2):
+    for i in range(2):
         chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
         chain.mine()
-        executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
+        executor.executeSlice(order_id, _uid(i), from_=keeper)
 
     balance_before = token.balanceOf(owner.address)
     executor.cancelTwapOrder(order_id, from_=owner)
-    balance_after = token.balanceOf(owner.address)
-
-    actual_refund   = balance_after - balance_before
-    expected_refund = TOTAL_AMOUNT - (2 * AMOUNT_PER_SLICE)
-
-    assert actual_refund == expected_refund, (
-        f"Refund: expected {expected_refund}, got {actual_refund}"
-    )
-
-    order = executor.getOrder(order_id)
-    assert order.status == ICowTwapExecutor.TwapStatus.CANCELLED
-
-    print(f"[PASS] Cancellation refund: {actual_refund // 10**18} tokens refunded (2/4 slices done)")
+    actual_refund = token.balanceOf(owner.address) - balance_before
+    assert actual_refund == TOTAL_AMOUNT - (2 * AMOUNT_PER_SLICE)
+    assert executor.getOrder(order_id).status == ICowTwapExecutor.TwapStatus.CANCELLED
+    print(f"[PASS] Cancellation refund: {actual_refund // 10**18} tokens (2/4 slices done)")
 
 
 @chain.connect()
 def test_permissionless_execution():
-    """Any account (keeper, stranger) can execute a ready slice."""
-    owner   = chain.accounts[0]
-    keeper  = chain.accounts[1]
-    stranger = chain.accounts[2]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, keeper, stranger = chain.accounts[0], chain.accounts[1], chain.accounts[2]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
-
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
 
-    # Keeper executes slice 1
     chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
     chain.mine()
-    executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
-    # Stranger executes slice 2
+    executor.executeSlice(order_id, _uid(0), from_=keeper)
     chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
     chain.mine()
-    executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=stranger)
-
-    order = executor.getOrder(order_id)
-    assert order.slicesExecuted == 2
-    print("[PASS] Permissionless: keeper and stranger both executed slices successfully")
+    executor.executeSlice(order_id, _uid(1), from_=stranger)
+    assert executor.getOrder(order_id).slicesExecuted == 2
+    print("[PASS] Permissionless: keeper and stranger both executed slices")
 
 
 @chain.connect()
 def test_non_owner_cannot_cancel():
-    """Stranger cannot cancel another user's order."""
-    owner   = chain.accounts[0]
-    stranger = chain.accounts[1]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, stranger = chain.accounts[0], chain.accounts[1]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
-
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
-
     with must_revert():
         executor.cancelTwapOrder(order_id, from_=stranger)
-
-    order = executor.getOrder(order_id)
-    assert order.status == ICowTwapExecutor.TwapStatus.ACTIVE, "Order was cancelled by stranger!"
-    print("[PASS] Access control: stranger's cancel attempt reverted")
+    assert executor.getOrder(order_id).status == ICowTwapExecutor.TwapStatus.ACTIVE
+    print("[PASS] Access control: stranger's cancel reverted")
 
 
 @chain.connect()
 def test_completed_order_cannot_be_re_executed():
-    """After all slices, further executeSlice calls revert."""
-    owner  = chain.accounts[0]
-    keeper = chain.accounts[1]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    owner, keeper = chain.accounts[0], chain.accounts[1]
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, TOTAL_AMOUNT, from_=owner)
-
     order_id = executor.createTwapOrder(
         token.address, TOTAL_AMOUNT, SLICE_COUNT, INTERVAL, 0, from_=owner
     ).return_value
-
-    for _ in range(SLICE_COUNT):
+    for i in range(SLICE_COUNT):
         chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
         chain.mine()
-        executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
-    # Completed — further attempts must revert
+        executor.executeSlice(order_id, _uid(i), from_=keeper)
     chain.set_next_block_timestamp(chain.blocks["latest"].timestamp + INTERVAL + 1)
     chain.mine()
     with must_revert():
-        executor.executeSlice(order_id, DUMMY_ORDER_UID, from_=keeper)
-
+        executor.executeSlice(order_id, _uid(99), from_=keeper)
     print("[PASS] State machine: executeSlice on COMPLETED order reverted")
 
 
 @chain.connect()
 def test_validation_invalid_params():
-    """createTwapOrder reverts on invalid parameters."""
     owner = chain.accounts[0]
-
-    relayer  = MockRelayer.deploy(from_=owner)
-    settler  = MockSettler.deploy(from_=owner)
-    executor = CowTwapExecutor.deploy(relayer.address, settler.address, from_=owner)
-    token    = MockToken.deploy("USDC", "USDC", from_=owner)
-
+    settlement, executor, token = _deploy(owner)
     token.mint(owner.address, 10 * TOTAL_AMOUNT, from_=owner)
     token.approve(executor.address, 10 * TOTAL_AMOUNT, from_=owner)
-
-    # Zero total amount
     with must_revert():
         executor.createTwapOrder(token.address, 0, SLICE_COUNT, INTERVAL, 0, from_=owner)
-
-    # Zero slice count
     with must_revert():
         executor.createTwapOrder(token.address, TOTAL_AMOUNT, 0, INTERVAL, 0, from_=owner)
-
-    # Zero interval
     with must_revert():
         executor.createTwapOrder(token.address, TOTAL_AMOUNT, SLICE_COUNT, 0, 0, from_=owner)
+    print("[PASS] Validation: invalid-parameter reverts triggered")
 
-    print("[PASS] Validation: all invalid-parameter reverts triggered correctly")
-
-
-# ---------------------------------------------------------------------------
-# Fuzz test entry point
-# ---------------------------------------------------------------------------
 
 @chain.connect()
 def test_fuzz_twap_invariants():
-    TwapFuzzTest.run(
-        sequences_count=30,
-        flows_count=80,
-    )
-    print("[PASS] Fuzz: all TWAP invariants held across 30x80 random operation sequences")
+    TwapFuzzTest.run(sequences_count=30, flows_count=80)
+    print("[PASS] Fuzz: all TWAP invariants held across 30x80 sequences")

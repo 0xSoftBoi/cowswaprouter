@@ -22,7 +22,9 @@
 - The amount, token, and receiver are encoded in the orderUid
 - CoW's settlement contract verifies the signature
 
-**Residual risk:** A keeper could pass an empty `orderUid` (skipping settlement while still advancing the slice counter). This would deposit tokens into CoW's vault without settling, potentially leaving them in limbo. Consider requiring non-empty `orderUid` in production deployments.
+**Mechanism:** `executeSlice` authorizes the slice's order via `setPreSignature(orderUid, true)` — it does **not** call `settle` (that is `onlySolver`). A solver later fills the presigned order; the relayer pulls `amountPerSlice` from escrow, and the order's `receiver` (the TWAP owner) gets the proceeds. A keeper cannot substitute a different order: the relayer can only pull via a settlement of an order this contract presigned.
+
+**Residual risk:** A keeper could pass an empty `orderUid`, advancing the slice counter without presigning anything — a wasted slice (no funds move). Consider requiring a non-empty `orderUid` in production.
 
 ---
 
@@ -51,6 +53,8 @@ All tokens are held in the executor contract for the full order duration.
 
 **Note:** Integer division means `amountPerSlice = totalAmount / sliceCount` floors. Dust (up to `sliceCount - 1` wei) stays in the contract indefinitely. This is a known minor issue — use `totalAmount` divisible by `sliceCount` to avoid.
 
+**In-flight presign caveat:** `executeSlice` moves no funds — it only presigns. `cancelTwapOrder` refunds the **un-executed** remainder (`totalAmount - slicesExecuted * amountPerSlice`); the executed portion stays in escrow to back slices that were presigned and may still be filled by a solver until their order's `validTo`. To kill an in-flight slice on cancel, the owner calls `revokePresignature(orderId, orderUid)`.
+
 ---
 
 ### 4. Interval Manipulation (Time Bandit)
@@ -63,43 +67,47 @@ All tokens are held in the executor contract for the full order duration.
 
 ### 5. CoW Protocol Trust Model
 
-This contract trusts:
-- `cowRelayer` to correctly handle the `deposit()` call
-- `cowSettler` to correctly enforce the `orderUid` terms
+This contract trusts the canonical CoW contracts (immutable; the relayer is read from the
+settlement at construction, so the two can't be mismatched):
+- `GPv2VaultRelayer` (the approval target) to pull `token` only as part of a settlement of
+  an order this contract presigned;
+- `GPv2Settlement` to enforce each presigned `orderUid`'s terms and to keep `settle`
+  `onlySolver`.
 
-Both are immutable addresses set at construction time. If they are malicious or compromised, this contract's guarantees are void. Use CoW's official deployed addresses:
-- `GPv2VaultRelayer`: [see CoW docs for per-network address]
-- `GPv2Settlement`: `0x9008D19f58AAbD9eD0D60971565AA8510560ab41` (same on all supported networks)
+If they are malicious or compromised, this contract's guarantees are void. Official addresses:
+- `GPv2Settlement`: `0x9008D19f58AAbD9eD0D60971565AA8510560ab41`
+- `GPv2VaultRelayer`: `0xC92E8bdf79f0507f65a392b0ab4667716BFE0110` (same on all supported networks)
 
 ---
 
 ## Integration Testing Limitation
 
-Full end-to-end testing requires a live CoW Protocol solver generating valid `orderUid` values. Unit tests use mock relayer and settler contracts that accept any input. The mock tests verify:
-- State machine transitions (ACTIVE → COMPLETED/CANCELLED)
-- Time interval enforcement
-- Access control
-- Refund math
+Full end-to-end testing requires a live CoW Protocol solver. The Foundry suite (`test/`,
+the executed one) uses a mock `GPv2Settlement` (records presignatures, exposes
+`vaultRelayer`) plus a **simulated solver fill** that pulls one slice from escrow via the
+standing approval. It verifies: presign-per-slice, the solver-fill pulling exactly
+`amountPerSlice`, state transitions, interval enforcement, access control, refund math,
+`revokePresignature`, and the ComposableCoW handler's part scheduling / span / `validate` /
+`verify`.
 
-They do NOT verify:
-- That a CoW solver will accept the order
-- That `minAmountOutPerSlice` is enforced by the real settler
-- Gas costs on mainnet
+It does NOT verify (no live solver): that a CoW solver accepts/settles the order, that
+`minAmountOutPerSlice` is enforced by the real settlement, or mainnet gas. The integration
+*shape* now matches real CoW (correct function signatures + canonical addresses); the
+prior version called mainnet-nonexistent `deposit`/`settle`.
 
 ---
 
-## Wake Static Analysis Results
+## Static analysis
 
-Analyzed with `wake detect all --min-impact medium` on `src/CowTwapExecutor.sol`:
+A prior `wake detect` run on the original contract reported no findings in
+`src/CowTwapExecutor.sol` (it uses OpenZeppelin `SafeERC20` throughout). That run
+**predates the PreSign rewrite** and has not been re-executed here — treat the Foundry
+suite as the current source of truth.
 
-**Result: No findings in `src/CowTwapExecutor.sol`.**
-
-The contract uses OpenZeppelin's `SafeERC20.safeTransferFrom` and `forceApprove` throughout — Wake's `unsafe-erc20-call` detector found no issues in the production contract. The only detector hits were in `tests/contracts/Mocks.sol` (a raw `IERC20.transferFrom` in the mock relayer — expected for test infrastructure).
-
-CEI pattern is strictly followed:
-- `createTwapOrder`: transfers tokens IN first (interaction), then records order (effect)
-- `executeSlice`: updates all state (effects) before calling relayer/settler (interactions)
-- `cancelTwapOrder`: sets status = CANCELLED (effect) before transferring refund out (interaction)
+CEI is strictly followed:
+- `createTwapOrder`: records the order (effects) before pulling tokens IN + approving the relayer (interactions).
+- `executeSlice`: updates all state (effects) before `setPreSignature` (interaction).
+- `cancelTwapOrder`: sets status = CANCELLED (effect) before transferring the refund out (interaction).
 
 ---
 
